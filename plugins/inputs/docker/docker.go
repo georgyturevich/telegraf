@@ -13,11 +13,12 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/docker/engine-api/client"
-	"github.com/docker/engine-api/types"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/api/types"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"runtime"
 )
 
 // Docker object
@@ -36,7 +37,7 @@ type Docker struct {
 type DockerClient interface {
 	Info(ctx context.Context) (types.Info, error)
 	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
-	ContainerStats(ctx context.Context, containerID string, stream bool) (io.ReadCloser, error)
+	ContainerStats(ctx context.Context, containerID string, stream bool) (types.ContainerStats, error)
 }
 
 // KB, MB, GB, TB, PB...human friendly
@@ -210,8 +211,8 @@ func (d *Docker) gatherInfo(acc telegraf.Accumulator) error {
 }
 
 func (d *Docker) gatherContainer(
-	container types.Container,
-	acc telegraf.Accumulator,
+container types.Container,
+acc telegraf.Accumulator,
 ) error {
 	var v *types.StatsJSON
 	// Parse container name
@@ -243,12 +244,12 @@ func (d *Docker) gatherContainer(
 
 	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout.Duration)
 	defer cancel()
-	r, err := d.client.ContainerStats(ctx, container.ID, false)
+	cStats, err := d.client.ContainerStats(ctx, container.ID, false)
 	if err != nil {
 		return fmt.Errorf("Error getting docker stats: %s", err.Error())
 	}
-	defer r.Close()
-	dec := json.NewDecoder(r)
+	defer cStats.Body.Close()
+	dec := json.NewDecoder(cStats.Body)
 	if err = dec.Decode(&v); err != nil {
 		if err == io.EOF {
 			return nil
@@ -267,12 +268,12 @@ func (d *Docker) gatherContainer(
 }
 
 func gatherContainerStats(
-	stat *types.StatsJSON,
-	acc telegraf.Accumulator,
-	tags map[string]string,
-	id string,
-	perDevice bool,
-	total bool,
+stat *types.StatsJSON,
+acc telegraf.Accumulator,
+tags map[string]string,
+id string,
+perDevice bool,
+total bool,
 ) {
 	now := stat.Read
 
@@ -313,7 +314,28 @@ func gatherContainerStats(
 		"usage_percent":             calculateMemPercent(stat),
 		"container_id":              id,
 	}
+
+	if runtime.GOOS == "windows" {
+		memfieldsWin := map[string]interface{}{
+			"usage":                     stat.MemoryStats.PrivateWorkingSet,
+			"commitbytes":               stat.MemoryStats.Commit,
+			"commitpeakbytes":           stat.MemoryStats.CommitPeak,
+			"privateworkingset":         stat.MemoryStats.PrivateWorkingSet,
+			//			"usage_percent":             calculateMemPercent(stat),
+			"container_id":              id,
+		}
+		memfields = memfieldsWin
+	}
+
 	acc.AddFields("docker_container_mem", memfields, tags, now)
+
+	var cpuPercent = 0.0
+	if runtime.GOOS == "windows" {
+		cpuPercent = calculateCPUPercentWindows(stat)
+	} else {
+		cpuPercent = calculateCPUPercent(stat)
+	}
+
 
 	cpufields := map[string]interface{}{
 		"usage_total":                  stat.CPUStats.CPUUsage.TotalUsage,
@@ -323,7 +345,7 @@ func gatherContainerStats(
 		"throttling_periods":           stat.CPUStats.ThrottlingData.Periods,
 		"throttling_throttled_periods": stat.CPUStats.ThrottlingData.ThrottledPeriods,
 		"throttling_throttled_time":    stat.CPUStats.ThrottlingData.ThrottledTime,
-		"usage_percent":                calculateCPUPercent(stat),
+		"usage_percent":                cpuPercent,
 		"container_id":                 id,
 	}
 	cputags := copyTags(tags)
@@ -405,14 +427,31 @@ func calculateCPUPercent(stat *types.StatsJSON) float64 {
 	return cpuPercent
 }
 
+// Copied from docker repo https://github.com/docker/docker/blob/master/cli/command/container/stats_helpers.go#L189
+func calculateCPUPercentWindows(v *types.StatsJSON) float64 {
+	// Max number of 100ns intervals between the previous time read and now
+	possIntervals := uint64(v.Read.Sub(v.PreRead).Nanoseconds()) // Start with number of ns intervals
+	possIntervals /= 100                                         // Convert to number of 100ns intervals
+	possIntervals *= uint64(v.NumProcs)                          // Multiple by the number of processors
+
+	// Intervals used
+	intervalsUsed := v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage
+
+	// Percentage avoiding divide-by-zero
+	if possIntervals > 0 {
+		return float64(intervalsUsed) / float64(possIntervals) * 100.0
+	}
+	return 0.00
+}
+
 func gatherBlockIOMetrics(
-	stat *types.StatsJSON,
-	acc telegraf.Accumulator,
-	tags map[string]string,
-	now time.Time,
-	id string,
-	perDevice bool,
-	total bool,
+stat *types.StatsJSON,
+acc telegraf.Accumulator,
+tags map[string]string,
+now time.Time,
+id string,
+perDevice bool,
+total bool,
 ) {
 	blkioStats := stat.BlkioStats
 	// Make a map of devices to their block io stats
